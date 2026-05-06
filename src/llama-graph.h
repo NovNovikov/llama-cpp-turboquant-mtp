@@ -17,7 +17,6 @@ struct ggml_context;
 struct ggml_tensor;
 
 struct llama_cparams;
-struct llama_layer;
 
 struct llama_memory_context_i;
 
@@ -32,7 +31,7 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
-    LLM_GRAPH_TYPE_DECODER_MTP,
+    LLM_GRAPH_TYPE_MTP,
 };
 
 enum llm_ffn_op_type {
@@ -119,6 +118,19 @@ public:
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
 
     const int64_t n_embd = 0;
+};
+
+// Gemma 4 MTP: last target token id + backbone hidden (n_bb floats) for a single step
+class llm_graph_input_mtp : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp() = default;
+    ~llm_graph_input_mtp() override = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * inp_last_token = nullptr; // I32 [1]
+    ggml_tensor * inp_h_prev     = nullptr; // F32 [n_bb, 1]
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -573,16 +585,21 @@ struct llm_graph_params {
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
         // first check the ubatch
+        // For MTP graphs we feed BOTH token and embd at the same time (the embedding is the
+        // backbone hidden state, the token is the previously sampled draft). The default
+        // check below requires at least one of those to be null in both ubatches; relax it
+        // for MTP so steps 1..N-1 inside a single decode_mtp can reuse the encoded graph
+        // (~5ms per step CPU encode is otherwise repeated).
+        const bool token_compat = (gtype == LLM_GRAPH_TYPE_MTP)
+            ? (!ubatch.token == !other.ubatch.token && !ubatch.embd == !other.ubatch.embd)
+            : ((!ubatch.token && !other.ubatch.token) || (!ubatch.embd && !other.ubatch.embd));
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
             ubatch.n_seq_tokens == other.ubatch.n_seq_tokens &&
             ubatch.n_seqs       == other.ubatch.n_seqs &&
             ubatch.n_seqs_unq   == other.ubatch.n_seqs_unq &&
-            (
-                (!ubatch.token && !other.ubatch.token) ||
-                (!ubatch.embd  && !other.ubatch.embd)
-            );
+            token_compat;
 
         // when we split the batch using "equal_seqs" we have to verify that the participating sequences are the same
         //   the reason is because the set of attention streams would be different for different sequences
@@ -645,7 +662,6 @@ public:
     ggml_tensor * get_logits()      const { return t_logits; }
     ggml_tensor * get_embd()        const { return t_embd; }
     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
-    ggml_tensor * get_h_pre_norm()  const { return t_h_pre_norm; }
 
     ggml_cgraph  * get_gf()  const { return gf; }
     ggml_context * get_ctx() const { return ctx_compute.get(); }
@@ -674,7 +690,6 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
-    ggml_tensor * t_h_pre_norm  = nullptr; // [n_embd, n_outputs] hidden state before final output norm
 
     std::map<llama_seq_id, ggml_tensor*> t_sampled_logits;
     std::map<llama_seq_id, ggml_tensor*> t_candidates;
@@ -710,12 +725,6 @@ using llm_graph_result_ptr = std::unique_ptr<llm_graph_result>;
 
 // used in build_rs to properly order writes and avoid unnecessary copies
 using llm_graph_get_rows_fn = std::function<ggml_tensor * (ggml_context *, ggml_tensor * states, ggml_tensor * ids)>;
-
-struct llm_graph_qkv {
-    ggml_tensor * q; // [n_embd_head, n_head,    n_tokens]
-    ggml_tensor * k; // [n_embd_head, n_head_kv, n_tokens]
-    ggml_tensor * v; // [n_embd_head, n_head_kv, n_tokens]
-};
 
 struct llm_graph_context {
     const llm_arch arch;
@@ -802,17 +811,6 @@ struct llm_graph_context {
              ggml_tensor * mb,
            llm_norm_type   type,
                      int   il) const;
-
-
-    // compute Q, K, V projections with optional bias and reshape
-    // supports both fused wqkv and separate wq/wk/wv paths
-    llm_graph_qkv build_qkv(
-        const llama_layer & layer,
-              ggml_tensor * cur,
-                  int64_t   n_embd_head,
-                  int64_t   n_head,
-                  int64_t   n_head_kv,
-                      int   il) const;
 
     ggml_tensor * build_ffn(
              ggml_tensor * cur,
@@ -913,7 +911,6 @@ struct llm_graph_context {
             llm_graph_input_attn_no_cache * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
-            ggml_tensor * wo_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
@@ -929,7 +926,6 @@ struct llm_graph_context {
             llm_graph_input_attn_kv * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
-            ggml_tensor * wo_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
@@ -945,7 +941,6 @@ struct llm_graph_context {
             llm_graph_input_attn_k * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
-            ggml_tensor * wo_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
@@ -962,7 +957,6 @@ struct llm_graph_context {
             llm_graph_input_attn_kv_iswa * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
-            ggml_tensor * wo_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens] optional
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens] optional
@@ -972,13 +966,31 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // Gemma 4 MTP: cross-read target KV at il_kv_tgt from SWA or base cache; no KV write (k_cur/v_cur absent).
+    // kv_* describe the **target** cache tensor layout at il_kv_tgt (for turbo V unpadded head extract).
+    // When use_k_as_v is true, V tensor is replaced by K (HF Gemma4 assistant full-layer shortcut).
+    ggml_tensor * build_attn_mtp(
+            llm_graph_input_attn_kv_iswa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * q_cur,
+            ggml_tensor * kq_b,
+            ggml_tensor * sinks,
+            ggml_tensor * v_mla,
+                  float   kq_scale,
+                    int   il_mtp,
+             int32_t   il_kv_tgt,
+                   bool   read_from_swa_kv,
+                int64_t   kv_embd_head_v,
+                int64_t   kv_n_head_v,
+                   bool   use_k_as_v) const;
+
     llm_graph_input_attn_cross * build_attn_inp_cross() const;
 
     ggml_tensor * build_attn(
             llm_graph_input_attn_cross * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
-            ggml_tensor * wo_s,
             ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
             ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
             ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
