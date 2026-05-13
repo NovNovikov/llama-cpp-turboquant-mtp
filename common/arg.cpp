@@ -412,6 +412,17 @@ const std::vector<ggml_type> kv_cache_types = {
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    // Accept convenient aliases without the "_0" suffix.
+    if (s == "turbo2") {
+        return GGML_TYPE_TURBO2_0;
+    }
+    if (s == "turbo3") {
+        return GGML_TYPE_TURBO3_0;
+    }
+    if (s == "turbo4") {
+        return GGML_TYPE_TURBO4_0;
+    }
+
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
