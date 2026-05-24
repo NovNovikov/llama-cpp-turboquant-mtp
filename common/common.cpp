@@ -1181,7 +1181,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
-            params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+            params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
         if (fit_status == COMMON_PARAMS_FIT_STATUS_ERROR) {
             // On hard fitting errors (e.g. model-load failure in probing path), keep original params
             // so normal model loading can still proceed.
@@ -1268,29 +1268,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.sampling.backend_sampling) {
         cparams.samplers   = pimpl->samplers_seq_config.data();
         cparams.n_samplers = pimpl->samplers_seq_config.size();
-    }
-
-    // [TAG_RS_STATE_ROLLBACK_SUPPORT]
-    // TODO: ngram speculative methods require checkpointing in addition to partial RS rollback
-    //       currently this is not supported. so we disable the partial rollback
-    if (cparams.n_rs_seq > 0 && (llama_model_is_recurrent(model) || llama_model_is_hybrid(model))) {
-        auto & types = params.speculative.types;
-
-        for (int i = 0; i < (int) types.size(); i++) {
-            if (types[i] == COMMON_SPECULATIVE_TYPE_NONE) {
-                continue;
-            }
-            if (types[i] == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
-                continue;
-            }
-
-            cparams.n_rs_seq = 0;
-
-            LOG_WRN("%s: recurrent state rollback is not compatible with '%s' - disabling rollback support\n", __func__,
-                    common_speculative_type_to_str(types[i]).c_str());
-
-            break;
-        }
     }
 
     llama_context * lctx = llama_init_from_model(model, cparams);
@@ -1403,7 +1380,7 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
     }
 
     if (params.warmup) {
-        LOG_WRN("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
+        LOG_INF("%s: warming up the model with an empty run - please wait ... (--no-warmup to disable)\n", __func__);
 
         llama_set_warmup(lctx, true);
 

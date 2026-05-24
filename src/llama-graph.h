@@ -594,7 +594,11 @@ struct llm_graph_params {
         // (~5ms per step CPU encode is otherwise repeated).
         const bool token_compat = (gtype == LLM_GRAPH_TYPE_MTP)
             ? (!ubatch.token == !other.ubatch.token && !ubatch.embd == !other.ubatch.embd)
-            : ((!ubatch.token && !other.ubatch.token) || (!ubatch.embd && !other.ubatch.embd));
+            : (
+                (!ubatch.token && !other.ubatch.token) ||
+                (!ubatch.embd  && !other.ubatch.embd)  ||
+                (ubatch.token && other.ubatch.token && ubatch.embd && other.ubatch.embd)
+            );
         bool can_reuse_ubatch =
             ubatch.equal_seqs() == other.ubatch.equal_seqs() &&
             ubatch.n_tokens     == other.ubatch.n_tokens &&
