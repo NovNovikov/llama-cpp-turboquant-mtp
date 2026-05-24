@@ -765,6 +765,9 @@ private:
         if (params_base.speculative.has_dft()) {
             // TODO speculative: move to common/speculative.cpp?
             const auto & params_spec = params_base.speculative.draft;
+            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
+                                            params_base.speculative.types.end(),
+                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
 
             SRV_INF("loading draft model '%s'\n", params_spec.mparams.path.c_str());
 
@@ -784,31 +787,72 @@ private:
             params_dft.tensor_buft_overrides = params_spec.tensor_buft_overrides;
 
             auto mparams_dft = common_model_params_to_llama(params_dft);
+            auto mparams_dft_safe = mparams_dft;
+            // Keep assistant loading deterministic and isolated from outer progress /
+            // buffer override state carried by the target model initialization.
+            mparams_dft_safe.progress_callback = nullptr;
+            mparams_dft_safe.progress_callback_user_data = nullptr;
+            mparams_dft_safe.tensor_buft_overrides = nullptr;
+            bool draft_ctx_ready = false;
 
-            model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft));
-            if (model_dft == nullptr) {
-                SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
-                return false;
-            }
-
-            auto cparams = common_context_params_to_llama(params_dft);
-
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+            // Gemma4 assistant MTP path: attach assistant weights to the target model and build
+            // an MTP path directly on target context (no secondary draft context required).
             if (spec_mtp) {
-                cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                const int mtp_err = llama_model_load_mtp_from_file(model_tgt, params_dft.model.path.c_str(), mparams_dft_safe);
+                if (mtp_err == 0) {
+                    // Single-context Gemma MTP: the assistant is attached to target and
+                    // speculative MTP runs via llama_decode_mtp(_async/_wait) on ctx_tgt.
+                    const llama_model * mtp_assistant = llama_model_get_mtp_assistant(model_tgt);
+                    if (mtp_assistant != nullptr) {
+                        params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                        params_base.speculative.draft.ctx_dft = nullptr;
+                        ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+                        draft_ctx_ready = true;
+                        SRV_INF("%s", "using single-context MTP (assistant attached to target)\n");
+                    } else {
+                        auto cparams_mtp = common_context_params_to_llama(params_dft);
+                        cparams_mtp.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                        cparams_mtp.n_rs_seq = 0;
+
+                        ctx_dft.reset(llama_init_from_model(model_tgt, cparams_mtp));
+                        if (ctx_dft == nullptr) {
+                            SRV_ERR("%s", "failed to create MTP draft context from target model\n");
+                            return false;
+                        }
+
+                        draft_ctx_ready = true;
+                    }
+                } else {
+                    SRV_WRN("failed to attach draft model as Gemma4 MTP assistant (err=%d), falling back to standalone draft context\n", mtp_err);
+                }
             }
 
-            // note: for small models maybe we can set this to the maximum possible draft from all speculative types
-            //       the extra memory for small models is likely negligible?
-            cparams.n_rs_seq = 0;
-            ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+            if (!draft_ctx_ready) {
+                model_dft.reset(llama_model_load_from_file(params_dft.model.path.c_str(), mparams_dft_safe));
+                if (model_dft == nullptr) {
+                    SRV_ERR("failed to load draft model, '%s'\n", params_dft.model.path.c_str());
+                    return false;
+                }
 
-            ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                auto cparams = common_context_params_to_llama(params_dft);
+                if (spec_mtp) {
+                    cparams.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+                }
 
-            params_base.speculative.draft.ctx_tgt = ctx_tgt;
-            params_base.speculative.draft.ctx_dft = ctx_dft.get();
+                // note: for small models maybe we can set this to the maximum possible draft from all speculative types
+                //       the extra memory for small models is likely negligible?
+                cparams.n_rs_seq = 0;
+                ctx_dft.reset(llama_init_from_model(model_dft.get(), cparams));
+            }
+
+            if (ctx_dft) {
+                ctx_dft_seq_rm_type = common_context_can_seq_rm(ctx_dft.get());
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = ctx_dft.get();
+            } else {
+                params_base.speculative.draft.ctx_tgt = ctx_tgt;
+                params_base.speculative.draft.ctx_dft = nullptr;
+            }
         } else if (std::find(params_base.speculative.types.begin(), params_base.speculative.types.end(),
                              COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end()) {
             SRV_INF("creating MTP draft context against the target model '%s'\n",

@@ -18,6 +18,7 @@
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
+#include <vector>
 
 // dedup helpers
 
@@ -104,14 +105,26 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
 }
 
 void llm_graph_input_mtp::set_input(const llama_ubatch * ubatch) {
-    GGML_ASSERT(ubatch && ubatch->n_tokens == 1);
-    GGML_ASSERT(ubatch->token && ubatch->embd);
     GGML_ASSERT(inp_last_token && inp_h_prev);
+    if (!ubatch || ubatch->n_tokens < 1) {
+        return;
+    }
 
-    ggml_backend_tensor_set(inp_last_token, ubatch->token, 0, sizeof(llama_token));
+    // One-step MTP consumes exactly one token + one hidden row; when the graph is
+    // instantiated with a wider placeholder ubatch, read the first element.
+    llama_token tok = 0;
+    if (ubatch->token) {
+        tok = ubatch->token[0];
+    }
+    ggml_backend_tensor_set(inp_last_token, &tok, 0, sizeof(llama_token));
 
     const int64_t n_bb = inp_h_prev->ne[0];
-    ggml_backend_tensor_set(inp_h_prev, ubatch->embd, 0, n_bb * sizeof(float));
+    if (ubatch->embd) {
+        ggml_backend_tensor_set(inp_h_prev, ubatch->embd, 0, n_bb * sizeof(float));
+    } else {
+        std::vector<float> zeros((size_t) n_bb, 0.0f);
+        ggml_backend_tensor_set(inp_h_prev, zeros.data(), 0, n_bb * sizeof(float));
+    }
 }
 
 bool llm_graph_input_mtp::can_reuse(const llm_graph_params & params) {

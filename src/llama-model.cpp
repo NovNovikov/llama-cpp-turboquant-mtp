@@ -134,6 +134,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_gemma3n(params);
         case LLM_ARCH_GEMMA4:
             return new llama_model_gemma4(params);
+        case LLM_ARCH_GEMMA4_ASSISTANT:
+            return new llama_model_gemma4_assistant(params);
         case LLM_ARCH_GEMMA_EMBEDDING:
             return new llama_model_gemma_embedding(params);
         case LLM_ARCH_STARCODER2:
@@ -1149,6 +1151,8 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
     }
 
     hparams.rope_type = llama_model_rope_type(this);
+    // GGML dropped support for legacy bit0 in rope mode; sanitize any legacy values.
+    hparams.rope_type = (llama_rope_type) ((int) hparams.rope_type & ~1);
 }
 
 void llama_model_base::load_vocab(llama_model_loader & ml) {

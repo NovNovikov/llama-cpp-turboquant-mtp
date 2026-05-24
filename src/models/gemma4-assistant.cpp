@@ -2,6 +2,130 @@
 
 #include <cmath>
 
+static ggml_tensor * checked_reshape_3d(
+        ggml_context * ctx0,
+        ggml_tensor * t,
+        int64_t ne0,
+        int64_t ne1,
+        int64_t ne2,
+        const char * where,
+        int il) {
+    const int64_t expected = ne0 * ne1 * ne2;
+    const int64_t actual   = ggml_nelements(t);
+    if (actual != expected) {
+        throw std::runtime_error(
+                std::string("gemma4_assistant: reshape mismatch at ") + where +
+                " layer=" + std::to_string(il) +
+                " tensor=" + (t && t->name ? t->name : "<unnamed>") +
+                " actual=" + std::to_string(actual) +
+                " expected=" + std::to_string(expected) +
+                " target_shape=(" + std::to_string(ne0) + "," + std::to_string(ne1) + "," + std::to_string(ne2) + ")" +
+                " src_shape=(" + std::to_string(t->ne[0]) + "," + std::to_string(t->ne[1]) + "," + std::to_string(t->ne[2]) + "," + std::to_string(t->ne[3]) + ")");
+    }
+    return ggml_reshape_3d(ctx0, t, ne0, ne1, ne2);
+}
+
+void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
+    hparams.swa_type = LLAMA_SWA_TYPE_STANDARD;
+    ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer);
+
+    uint32_t n_kv_shared_layers = 0;
+    ml.get_key(LLM_KV_ATTENTION_SHARED_KV_LAYERS, n_kv_shared_layers, false);
+
+    // Assistant layers read KV from the target model during MTP and do not carry an
+    // internal KV-sharing topology like the base decoder. Avoid negative shared-layer
+    // indices when metadata reports all layers as shared.
+    hparams.n_layer_kv_from_start =
+            n_kv_shared_layers >= hparams.n_layer
+            ? (int32_t) hparams.n_layer
+            : (int32_t) hparams.n_layer - (int32_t) n_kv_shared_layers;
+    hparams.f_attention_scale     = 1.0f;
+
+    ml.get_key(LLM_KV_ROPE_FREQ_BASE_SWA,          hparams.rope_freq_base_train_swa, false);
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,    hparams.n_swa);
+    ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
+    ml.get_key(LLM_KV_FINAL_LOGIT_SOFTCAPPING,     hparams.f_final_logit_softcapping, false);
+
+    ml.get_key(LLM_KV_ATTENTION_KEY_LENGTH_SWA,   hparams.n_embd_head_k_swa);
+    ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA, hparams.n_embd_head_v_swa);
+
+    ml.get_key(LLM_KV_GEMMA4_ASSISTANT_N_EMBD_BACKBONE,        hparams.n_embd_backbone, false);
+    ml.get_key(LLM_KV_GEMMA4_ASSISTANT_N_CENTROIDS,            hparams.n_centroids, false);
+    ml.get_key(LLM_KV_GEMMA4_ASSISTANT_CENTROID_TOP_K,         hparams.centroid_top_k, false);
+    ml.get_key(LLM_KV_GEMMA4_ASSISTANT_ATTENTION_K_EQ_V,       hparams.attention_k_eq_v, false);
+    ml.get_key(LLM_KV_GEMMA4_ASSISTANT_USE_ORDERED_EMBEDDINGS, hparams.use_ordered_embeddings, false);
+
+    type = LLM_TYPE_UNKNOWN;
+}
+
+void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
+    LLAMA_LOAD_LOCALS;
+
+    const uint32_t n_bb = hparams.n_embd_backbone;
+    if (n_bb == 0) {
+        throw std::runtime_error("gemma4_assistant: n_embd_backbone must be set in GGUF metadata");
+    }
+    if (n_embd_head_k != n_embd_head_v) {
+        throw std::runtime_error("Gemma 4 assistant requires n_embd_head_k == n_embd_head_v");
+    }
+    if (hparams.n_embd_head_k_swa != hparams.n_embd_head_v_swa) {
+        throw std::runtime_error("Gemma 4 assistant requires n_embd_head_k_swa == n_embd_head_v_swa");
+    }
+
+    // Tied lm_head uses token_embd; inner hidden size is hparams.n_embd (e.g. 1024)
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, 0);
+
+    mtp_pre_projection  = create_tensor(tn(LLM_TENSOR_MTP_PRE_PROJECTION,  "weight"), {2 * (int64_t) n_bb, n_embd}, 0);
+    mtp_post_projection = create_tensor(tn(LLM_TENSOR_MTP_POST_PROJECTION, "weight"), {n_embd, (int64_t) n_bb}, 0);
+
+    if (hparams.use_ordered_embeddings) {
+        const uint32_t n_c = hparams.n_centroids;
+        if (n_c == 0) {
+            throw std::runtime_error("gemma4_assistant: use_ordered_embeddings requires n_centroids > 0");
+        }
+
+        // ggml_mul_mat(centroids, h) requires centroids.ne[0] == n_embd (same as token_embd.weight).
+        mtp_centroids      = create_tensor(tn(LLM_TENSOR_MTP_CENTROIDS,      "weight"), {n_embd, (int64_t) n_c}, 0);
+        mtp_token_ordering = create_tensor(tn(LLM_TENSOR_MTP_TOKEN_ORDERING, "weight"), {(int64_t) n_vocab}, TENSOR_NOT_REQUIRED);
+    }
+
+    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
+
+    int rope_freqs_flag = 0;
+
+    for (int i = 0; i < n_layer; ++i) {
+        auto & layer = layers[i];
+        const int64_t n_head      = hparams.n_head(i);
+        const int64_t n_embd_head = hparams.n_embd_head_k(i);
+        const int64_t n_ff_cur    = hparams.n_ff(i);
+
+        layer.attn_norm = create_tensor(tn(LLM_TENSOR_ATTN_NORM, "weight", i), {n_embd}, 0);
+
+        layer.wq = create_tensor(tn(LLM_TENSOR_ATTN_Q,   "weight", i), {n_embd, n_embd_head * n_head}, 0);
+        layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", i), {n_embd_head * n_head, n_embd}, 0);
+
+        layer.attn_q_norm    = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM,    "weight", i), {n_embd_head}, 0);
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", i), {n_embd}, 0);
+
+        layer.out_scale = create_tensor(tn(LLM_TENSOR_LAYER_OUT_SCALE, "weight", i), {1u}, TENSOR_NOT_REQUIRED);
+
+        if (!hparams.is_swa(i)) {
+            layer.rope_freqs = create_tensor(tn(LLM_TENSOR_ROPE_FREQS, "weight", i), {n_embd_head/2}, rope_freqs_flag);
+            rope_freqs_flag = TENSOR_DUPLICATED;
+        }
+
+        layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff_cur}, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff_cur}, 0);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_cur, n_embd}, 0);
+        layer.ffn_post_norm = create_tensor(tn(LLM_TENSOR_FFN_POST_NORM, "weight", i), {n_embd}, 0);
+    }
+}
+
+std::unique_ptr<llm_graph_context> llama_model_gemma4_assistant::build_arch_graph(const llm_graph_params &) const {
+    throw std::runtime_error("gemma4_assistant is not a standalone generation architecture; load it via --model-draft with draft-mtp");
+}
+
 static llm_graph_params graph_params_for_mtp(llm_graph_params p, const llama_model & mtp_model) {
     p.arch    = mtp_model.arch;
     p.hparams = mtp_model.hparams;
@@ -56,9 +180,8 @@ static void gemma4_mtp_build_one_step(
     const auto & hparams = gctx.hparams;
     const auto & cparams = gctx.cparams;
     const int    n_layer = (int) gctx.n_layer;
-    const int    n_tokens     = (int) gctx.n_tokens;
     const int    n_ctx_orig   = (int) gctx.n_ctx_orig;
-    const int    rope_type    = gctx.rope_type;
+    const int    rope_type    = (int) target.hparams.rope_type;
     const float  ext_factor   = gctx.ext_factor;
     const float  attn_factor  = gctx.attn_factor;
     const float  beta_fast    = gctx.beta_fast;
@@ -106,12 +229,17 @@ static void gemma4_mtp_build_one_step(
         ggml_tensor * Qcur = gctx.build_lora_mm(mtp.layers[il].wq, cur);
         cb(Qcur, "Qcur", il);
 
-        Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens);
+        // One MTP step always consumes a single token column. gctx.n_tokens may be
+        // configured to the max draft width (e.g. 16) and must not be used here.
+        const int64_t q_tokens = Qcur->ne[1];
+        Qcur = checked_reshape_3d(ctx0, Qcur, n_embd_head, n_head, q_tokens, "Qcur", il);
 
         Qcur = gctx.build_norm(Qcur, mtp.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
         cb(Qcur, "Qcur_normed", il);
 
-        Qcur = ggml_rope_ext(ctx0, Qcur, pos_step, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
+        GGML_ASSERT((rope_type & GGML_ROPE_TYPE_MROPE) == 0 && "Gemma4 assistant MTP expects scalar positions (non-MROPE)");
+        ggml_tensor * pos_scalar = pos_step->ne[0] == 1 ? pos_step : ggml_view_1d(ctx0, pos_step, 1, 0);
+        Qcur = ggml_rope_ext(ctx0, Qcur, pos_scalar, freq_factors, n_rot_l, rope_type, n_ctx_orig, freq_base_l, freq_scale_l,
                              ext_factor, attn_factor, beta_fast, beta_slow);
         cb(Qcur, "Qcur_pos", il);
 
