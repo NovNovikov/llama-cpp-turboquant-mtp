@@ -524,6 +524,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     };
 
     auto parse_cli_args = [&]() {
+        // Server debug convenience:
+        // allow `--log-rendered-prompt` without a value and default to a local
+        // `prompt.log` in the current llama.cpp working directory.
+        static constexpr const char * k_default_rendered_prompt_log_path = "prompt.log";
         std::set<std::string> seen_args;
 
         for (int i = 1; i < argc; i++) {
@@ -560,6 +564,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
 
                 // arg with single value
+                if (opt.handler_string && arg == "--log-rendered-prompt") {
+                    const bool has_next_value = (i + 1 < argc) && (argv[i + 1][0] != '-');
+                    if (!has_next_value) {
+                        opt.handler_string(params, k_default_rendered_prompt_log_path);
+                        continue;
+                    }
+                }
                 check_arg(i);
                 std::string val = argv[++i];
                 if (opt.handler_int) {
@@ -2860,6 +2871,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.api_prefix = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_PREFIX"));
+    add_opt(common_arg(
+        {"--log-rendered-prompt"}, "PATH",
+        "debug: append final rendered prompt (after chat template/Jinja/prefill) as JSONL for each chat/completion request (if PATH omitted, defaults to ./prompt.log)",
+        [](common_params & params, const std::string & value) {
+            params.log_rendered_prompt = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_RENDERED_PROMPT"));
     // Deprecated: use --ui-config instead (kept for backward compat)
     add_opt(common_arg(
         {"--webui-config"}, "JSON",
