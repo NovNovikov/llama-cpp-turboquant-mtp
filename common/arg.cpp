@@ -1340,6 +1340,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"-cpent", "--checkpoint-every-n-tokens"}, "N",
+        string_format("create context checkpoints every N prompt tokens during prefill (default: %d, <= 0 disables periodic scheduling)",
+                      params.checkpoint_every_n_tokens),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("checkpoint-every-n-tokens must be >= -1");
+            }
+            params.checkpoint_every_n_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_EVERY_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
         [](common_params & params, int value) {

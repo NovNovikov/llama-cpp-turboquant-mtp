@@ -107,6 +107,7 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+    int64_t next_periodic_checkpoint_nt = -1;
 
     size_t last_nl_pos = 0;
 
@@ -205,6 +206,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        next_periodic_checkpoint_nt = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -1159,6 +1161,12 @@ private:
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_INF("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
+            if (params_base.checkpoint_every_n_tokens > 0) {
+                SRV_INF("periodic context checkpointing enabled: every %d prompt tokens\n",
+                        params_base.checkpoint_every_n_tokens);
+            } else {
+                SRV_INF("%s", "periodic context checkpointing disabled (use `-cpent N`)\n");
+            }
         } else {
             SRV_INF("%s", "context checkpoints disabled\n");
         }
@@ -2065,8 +2073,10 @@ private:
             // make room for the new checkpoint, if needed
             const auto & cur = slot.prompt.checkpoints.front();
 
-            SLT_WRN(slot, "erasing old context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+            SLT_WRN(slot,
+                    "erasing old context checkpoint due to --ctx-checkpoints=%d limit"
+                    " (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    params_base.n_ctx_checkpoints, cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
@@ -2811,10 +2821,17 @@ private:
                                 n_past = 0;
                             }
 
-                            llama_pos pos_next = slot.prompt.tokens.pos_next(n_past);
+                            // Keep these positions separate:
+                            //  - pos_diverge: actual prompt divergence boundary (common-prefix boundary)
+                            //  - pos_restore: working position after optional checkpoint restore/reset
+                            // Using pos_restore for checkpoint invalidation is too aggressive for SWA:
+                            // restoring an older checkpoint may move this position backward even when
+                            // newer checkpoints are still valid relative to the real divergence.
+                            const llama_pos pos_diverge = slot.prompt.tokens.pos_next(n_past);
+                            llama_pos pos_restore = pos_diverge;
 
                             // the largest pos_min required for a checkpoint to be useful
-                            const auto pos_min_thold = std::max(0, pos_next - n_swa - 1);
+                            const auto pos_min_thold = std::max(0, pos_restore - n_swa - 1);
 
                             if (n_past > 0 && n_past <= slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -2881,31 +2898,42 @@ private:
 
                                     bool do_reset = it == slot.prompt.checkpoints.rend();
 
+                                    bool did_restore_checkpoint = false;
+
                                     if (!do_reset) {
                                         // restore the context checkpoint
                                         it->load_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                                         it->load_dft(ctx_dft.get(), slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
-                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                        pos_restore = std::min(pos_restore, std::max(it->pos_min + 1, it->pos_max));
+                                        n_past      = std::min(slot.prompt.tokens.size_up_to_pos(pos_restore), (size_t) it->n_tokens);
+                                        did_restore_checkpoint = true;
                                         SLT_WRN(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
                                     if (do_reset) {
                                         SLT_WRN(slot, "forcing full prompt re-processing due to lack of cache data (likely due to SWA or hybrid/recurrent memory, see %s)\n",
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
-                                        pos_next = 0;
+                                        pos_restore = 0;
                                         n_past = 0;
+                                    }
+
+                                    if (did_restore_checkpoint && pos_restore != pos_diverge) {
+                                        SLT_INF(slot,
+                                                "checkpoint restore moved working position from %d to %d; checkpoint invalidation will use divergence boundary %d\n",
+                                                pos_diverge, pos_restore, pos_diverge);
                                     }
                                 }
                             }
 
                             {
-                                // erase any checkpoints with pos_max > pos_next
+                                // Invalidate checkpoints using the real divergence boundary, not the
+                                // restored position. This avoids over-aggressive erasure after
+                                // restoring an older SWA checkpoint.
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
-                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
+                                    if (cur.pos_max > pos_diverge) {
+                                        SLT_WRN(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, divergence_pos = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_diverge, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
                                         ++it;
@@ -3025,6 +3053,11 @@ private:
 
                     const int32_t n_before_user = slot.task->params.n_before_user;
                     const bool n_before_user_known = n_before_user > 0;
+                    const bool periodic_checkpointing_enabled = params_base.checkpoint_every_n_tokens > 0;
+
+                    if (do_checkpoint && periodic_checkpointing_enabled && slot.next_periodic_checkpoint_nt < 0) {
+                        slot.next_periodic_checkpoint_nt = params_base.checkpoint_every_n_tokens;
+                    }
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
@@ -3066,7 +3099,7 @@ private:
                         //  - 4 + n_ubatch
                         //  - 4
                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint) {
+                        if (do_checkpoint && !periodic_checkpointing_enabled) {
                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
 
                             bool should_break = false;
@@ -3101,11 +3134,6 @@ private:
                         slot.i_batch   = batch.n_tokens - 1;
 
                         slot.init_sampler();
-                    } else {
-                        // skip ordinary mid-prompt checkpoints
-                        if (!n_before_user_known && !near_prompt_end) {
-                            do_checkpoint = false;
-                        }
                     }
 
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
@@ -3115,8 +3143,12 @@ private:
                     // their token position is the batch start rather than the prompt end
                     const int32_t n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    {
-                        const bool is_on_user =
+                    bool is_periodic_checkpoint = false;
+                    bool is_user_boundary_checkpoint = false;
+                    bool is_prompt_tail_checkpoint = false;
+
+                    if (do_checkpoint) {
+                        is_user_boundary_checkpoint =
                             n_before_user_known &&
                             n_tokens_start == n_before_user;
 
@@ -3124,12 +3156,24 @@ private:
                             n_before_user_known &&
                             n_tokens_start > n_before_user;
 
-                        const bool is_allowed =
-                            !n_before_user_known ||
-                            is_on_user ||
-                            (is_after_user && near_prompt_end);
+                        if (periodic_checkpointing_enabled && near_prompt_end && (!n_before_user_known || is_after_user)) {
+                            SLT_DBG(slot, "%s", "near-end extra checkpoint suppressed because periodic checkpointing is enabled\n");
+                        }
 
-                        if (do_checkpoint && !is_allowed) {
+                        // With periodic scheduling enabled, tail extras are suppressed to
+                        // avoid redundant Gemma-sized checkpoints near prompt end.
+                        is_prompt_tail_checkpoint =
+                            !periodic_checkpointing_enabled &&
+                            near_prompt_end &&
+                            (!n_before_user_known || is_after_user);
+
+                        is_periodic_checkpoint =
+                            periodic_checkpointing_enabled &&
+                            n_tokens_start >= slot.next_periodic_checkpoint_nt;
+
+                        // Keep #22929 behavior for latest-user/tail checkpoints, while
+                        // explicitly re-enabling periodic mid-prompt checkpoints.
+                        if (!(is_user_boundary_checkpoint || is_prompt_tail_checkpoint || is_periodic_checkpoint)) {
                             do_checkpoint = false;
                         }
                     }
@@ -3143,14 +3187,38 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    // no need to create checkpoints that are too close together
-                    do_checkpoint = do_checkpoint && (slot.prompt.checkpoints.empty() || n_tokens_start > slot.prompt.checkpoints.back().n_tokens + params_base.checkpoint_min_step);
+                    bool skipped_by_min_step = false;
+                    if (do_checkpoint && !slot.prompt.checkpoints.empty()) {
+                        const int64_t last_n_tokens = slot.prompt.checkpoints.back().n_tokens;
+                        if (n_tokens_start <= last_n_tokens + params_base.checkpoint_min_step) {
+                            do_checkpoint = false;
+                            skipped_by_min_step = true;
+                        }
+                    }
+
+                    if (skipped_by_min_step) {
+                        const int64_t last_n_tokens = slot.prompt.checkpoints.back().n_tokens;
+                        SLT_INF(slot,
+                                "skipped context checkpoint at n_tokens = %d due to --checkpoint-min-step=%d (last checkpoint n_tokens = %" PRId64 ")\n",
+                                n_tokens_start, params_base.checkpoint_min_step, last_n_tokens);
+                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        if (is_periodic_checkpoint) {
+                            SLT_INF(slot,
+                                    "creating periodic context checkpoint at n_tokens = %d (interval = %d)\n",
+                                    n_tokens_start, params_base.checkpoint_every_n_tokens);
+                        }
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    if (periodic_checkpointing_enabled && slot.next_periodic_checkpoint_nt > 0) {
+                        while (slot.next_periodic_checkpoint_nt <= n_tokens_start) {
+                            slot.next_periodic_checkpoint_nt += params_base.checkpoint_every_n_tokens;
+                        }
                     }
                 }
 
