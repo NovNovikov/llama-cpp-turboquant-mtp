@@ -587,6 +587,45 @@ static std::string debug_get_rendered_prompt_text(const json & data) {
     return rendered_prompt;
 }
 
+static std::string debug_make_timestamp_utc() {
+    const auto now = std::chrono::system_clock::now();
+    const auto tt  = std::chrono::system_clock::to_time_t(now);
+    const auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+
+    std::tm tm_utc = {};
+#if defined(_WIN32)
+    gmtime_s(&tm_utc, &tt);
+#else
+    gmtime_r(&tt, &tm_utc);
+#endif
+
+    std::ostringstream oss;
+    oss << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%S")
+        << '.' << std::setw(3) << std::setfill('0') << ms.count() << 'Z';
+    return oss.str();
+}
+
+static std::string debug_extract_request_id(const server_http_req & req, const std::string & fallback_request_id) {
+    for (const auto & h : req.headers) {
+        if (h.first == "x-request-id" || h.first == "X-Request-Id" || h.first == "X-Request-ID") {
+            return h.second;
+        }
+    }
+    return fallback_request_id;
+}
+
+static void debug_append_jsonl_record(const std::string & path, const char * flag_name, const json & rec) {
+    static std::mutex log_mutex;
+
+    std::lock_guard<std::mutex> lock(log_mutex);
+    std::ofstream out(path, std::ios::app | std::ios::binary);
+    if (!out.is_open()) {
+        SRV_WRN("failed to open %s path for append: %s\n", flag_name, path.c_str());
+        return;
+    }
+    out << rec.dump() << '\n';
+}
+
 // Debug helper: print rendered prompt right before timing summary lines.
 // Enabled only when --log-rendered-prompt is set.
 static void debug_log_rendered_prompt_console_before_timings(const common_params & params, const server_slot & slot) {
@@ -601,6 +640,51 @@ static void debug_log_rendered_prompt_console_before_timings(const common_params
     SLT_INF(slot, "rendered_prompt debug BEGIN (%zu chars)\n", rendered_prompt.size());
     SLT_INF(slot, "%s\n", rendered_prompt.c_str());
     SLT_INF(slot, "%s", "rendered_prompt debug END\n");
+}
+
+// Debug helper: print final generated output to the server console when explicitly enabled.
+// This is intended for prompt/output rendering diagnostics only.
+static void debug_log_generated_output_console(const common_params & params, const server_slot & slot, const std::string & generated_output) {
+    if (params.log_generated_output.empty() || generated_output.empty()) {
+        return;
+    }
+
+    SLT_INF(slot, "generated_output debug BEGIN (%zu chars)\n", generated_output.size());
+    SLT_INF(slot, "%s\n", generated_output.c_str());
+    SLT_INF(slot, "%s", "generated_output debug END\n");
+}
+
+// Debug helper:
+// appends one JSONL record with the final generated output from server chat/completion paths.
+// Kept separate from prompt logging so each trace can be enabled independently.
+static void debug_log_generated_output_jsonl(
+        const common_params & params,
+        const server_slot & slot,
+        const std::string & generated_output) {
+    if (params.log_generated_output.empty() || generated_output.empty() || !slot.task) {
+        return;
+    }
+
+    json rec = {
+        {"timestamp",          debug_make_timestamp_utc()},
+        {"output_char_length", (int64_t) generated_output.size()},
+        {"generated_output",   generated_output},
+    };
+
+    if (!slot.task->debug_endpoint.empty()) {
+        rec["endpoint"] = slot.task->debug_endpoint;
+    }
+    if (!slot.task->debug_request_id.empty()) {
+        rec["request_id"] = slot.task->debug_request_id;
+    }
+    if (slot.id >= 0) {
+        rec["slot_id"] = slot.id;
+    }
+    if (slot.n_decoded >= 0) {
+        rec["output_token_count"] = slot.n_decoded;
+    }
+
+    debug_append_jsonl_record(params.log_generated_output, "--log-generated-output", rec);
 }
 
 //
@@ -1850,6 +1934,7 @@ private:
 
     void send_final_response(server_slot & slot) {
         auto res = std::make_unique<server_task_result_cmpl_final>();
+        const std::string generated_output = slot.generated_text;
 
         res->id      = slot.task->id;
         res->id_slot = slot.id;
@@ -1907,6 +1992,9 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        debug_log_generated_output_console(params_base, slot, generated_output);
+        debug_log_generated_output_jsonl(params_base, slot, generated_output);
 
         queue_results.send(std::move(res));
     }
@@ -3791,26 +3879,6 @@ static void debug_log_rendered_prompt_jsonl(
         return;
     }
 
-    static std::mutex log_mutex;
-
-    auto make_timestamp_utc = []() {
-        const auto now = std::chrono::system_clock::now();
-        const auto tt  = std::chrono::system_clock::to_time_t(now);
-        const auto ms  = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
-
-        std::tm tm_utc = {};
-#if defined(_WIN32)
-        gmtime_s(&tm_utc, &tt);
-#else
-        gmtime_r(&tt, &tm_utc);
-#endif
-
-        std::ostringstream oss;
-        oss << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%S")
-            << '.' << std::setw(3) << std::setfill('0') << ms.count() << 'Z';
-        return oss.str();
-    };
-
     const std::string rendered_prompt = debug_get_rendered_prompt_text(data);
 
     int64_t prompt_token_count = 0;
@@ -3818,19 +3886,10 @@ static void debug_log_rendered_prompt_jsonl(
         prompt_token_count += (int64_t) t.size();
     }
 
-    std::string request_id;
-    for (const auto & h : req.headers) {
-        if (h.first == "x-request-id" || h.first == "X-Request-Id" || h.first == "X-Request-ID") {
-            request_id = h.second;
-            break;
-        }
-    }
-    if (request_id.empty()) {
-        request_id = fallback_request_id;
-    }
+    const std::string request_id = debug_extract_request_id(req, fallback_request_id);
 
     json rec = {
-        {"timestamp",          make_timestamp_utc()},
+        {"timestamp",          debug_make_timestamp_utc()},
         {"endpoint",           req.path},
         {"prompt_char_length", (int64_t) rendered_prompt.size()},
         {"prompt_token_count", prompt_token_count},
@@ -3844,13 +3903,7 @@ static void debug_log_rendered_prompt_jsonl(
         rec["request_id"] = request_id;
     }
 
-    std::lock_guard<std::mutex> lock(log_mutex);
-    std::ofstream out(params.log_rendered_prompt, std::ios::app | std::ios::binary);
-    if (!out.is_open()) {
-        SRV_WRN("failed to open --log-rendered-prompt path for append: %s\n", params.log_rendered_prompt.c_str());
-        return;
-    }
-    out << rec.dump() << '\n';
+    debug_append_jsonl_record(params.log_rendered_prompt, "--log-rendered-prompt", rec);
 }
 
 
@@ -3895,6 +3948,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
 
         const std::string rendered_prompt_for_debug = debug_get_rendered_prompt_text(data);
+        const std::string request_id_for_debug = debug_extract_request_id(req, completion_id);
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
@@ -3905,6 +3959,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.tokens = std::move(inputs[i]);
             task.debug_rendered_prompt = rendered_prompt_for_debug;
+            task.debug_request_id = request_id_for_debug;
+            task.debug_endpoint   = req.path;
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.vocab,
                     params,

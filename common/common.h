@@ -606,6 +606,7 @@ struct common_params {
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
     std::string log_rendered_prompt = "";                                                                   // NOLINT
+    std::string log_generated_output = "";                                                                  // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT
     bool enable_chat_template = true;

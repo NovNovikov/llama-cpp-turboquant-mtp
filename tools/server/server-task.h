@@ -152,6 +152,9 @@ struct server_task {
     // Debug-only: final prompt text after chat-template/Jinja/prefill rendering.
     // Used by server logging, does not affect generation behavior.
     std::string debug_rendered_prompt;
+    // Debug-only request metadata for server-side JSONL logging.
+    std::string debug_request_id;
+    std::string debug_endpoint;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -241,6 +244,8 @@ struct server_task {
         copy.type      = type;
         copy.tokens    = tokens.clone();
         copy.debug_rendered_prompt = debug_rendered_prompt;
+        copy.debug_request_id = debug_request_id;
+        copy.debug_endpoint   = debug_endpoint;
         copy.id_slot   = -1; // child tasks cannot specify slot
 
         // use different sampling seed for each child
