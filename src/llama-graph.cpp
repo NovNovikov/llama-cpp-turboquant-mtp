@@ -214,6 +214,14 @@ void llm_graph_input_pos_bucket_kv::set_input(const llama_ubatch * ubatch) {
 void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(out_ids);
 
+    if (n_outputs == 0) {
+        return;
+    }
+
+    if (out_ids->buffer == nullptr) {
+        return;
+    }
+
     const int64_t n_tokens = ubatch->n_tokens;
 
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
@@ -904,6 +912,7 @@ void llm_graph_result::reset() {
     t_logits      = nullptr;
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
+    t_h_pre_norm  = nullptr;
     t_sampled.clear();
     t_sampled_probs.clear();
     t_sampled_logits.clear();
@@ -941,6 +950,9 @@ void llm_graph_result::set_outputs() {
     }
     if (t_embd_pooled != nullptr) {
         ggml_set_output(t_embd_pooled);
+    }
+    if (t_h_pre_norm != nullptr) {
+        ggml_set_output(t_h_pre_norm);
     }
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);

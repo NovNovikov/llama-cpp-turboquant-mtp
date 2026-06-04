@@ -288,6 +288,7 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
             return;
         }
 
+        const bool use_pre_norm = llama_get_embeddings_pre_norm(ctx_dft) != nullptr;
         int i = 0;
 
         while (n_drafting > 0) {
@@ -492,6 +493,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
+        llama_set_embeddings_pre_norm(ctx_tgt, true);
+        llama_set_embeddings_pre_norm(ctx_dft, true);
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
@@ -593,8 +596,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
+            const bool use_pre_norm = llama_get_embeddings_pre_norm(ctx_tgt) != nullptr;
+
             {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                const float * h_tgt = use_pre_norm ? llama_get_embeddings_pre_norm(ctx_tgt) : llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -611,7 +616,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
             }
 
+            // Debug note: for Qwen-style native MTP we only need pre-norm rows during
+            // draft generation. Prompt-sync should advance ctx_dft without materializing
+            // those rows, otherwise prefill can degenerate into all-token outputs again.
+            if (use_pre_norm) {
+                llama_set_embeddings_pre_norm(ctx_dft, false);
+            }
             const int32_t rc = llama_decode(ctx_dft, batch);
+            if (use_pre_norm) {
+                llama_set_embeddings_pre_norm(ctx_dft, true);
+            }
             if (rc != 0) {
                 LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (pos=%d)\n", __func__, (int) rc, (int) batch_in.pos[0]);
                 return false;
@@ -628,7 +642,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
+                const float * h = use_pre_norm
+                    ? llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i)
+                    : llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
@@ -689,7 +705,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 auto * smpl = smpls[seq_id].get();
 
                 common_sampler_sample(smpl, ctx_dft, i_batch, true);
-                h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
+                h_row = use_pre_norm ? llama_get_embeddings_pre_norm_ith(ctx_dft, i_batch)
+                                     : llama_get_embeddings_nextn_ith(ctx_dft, i_batch);
                 ++i_batch;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
