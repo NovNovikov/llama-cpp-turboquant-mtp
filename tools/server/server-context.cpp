@@ -112,7 +112,11 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
+    int64_t checkpoint_quarter_nt = -1;
+    int64_t checkpoint_midpoint_nt = -1;
     int64_t next_periodic_checkpoint_nt = -1;
+    bool checkpoint_quarter_done = false;
+    bool checkpoint_midpoint_done = false;
 
     size_t last_nl_pos = 0;
 
@@ -211,7 +215,11 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        checkpoint_quarter_nt = -1;
+        checkpoint_midpoint_nt = -1;
         next_periodic_checkpoint_nt = -1;
+        checkpoint_quarter_done = false;
+        checkpoint_midpoint_done = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -241,6 +249,45 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+    }
+
+    void init_checkpoint_schedule(const int32_t n_tokens_total, const int32_t n_past, const int32_t step) {
+        checkpoint_quarter_nt = n_tokens_total / 4;
+        checkpoint_midpoint_nt = n_tokens_total / 2;
+
+        checkpoint_quarter_done = checkpoint_quarter_nt <= 0 || n_past >= checkpoint_quarter_nt;
+        checkpoint_midpoint_done = checkpoint_midpoint_nt <= 0 || n_past >= checkpoint_midpoint_nt;
+
+        next_periodic_checkpoint_nt = -1;
+        if (step > 0) {
+            int64_t next = checkpoint_midpoint_nt + step;
+            while (next <= n_past) {
+                next += step;
+            }
+            if (next < n_tokens_total) {
+                next_periodic_checkpoint_nt = next;
+            }
+        }
+    }
+
+    int64_t next_prompt_checkpoint_target_nt() const {
+        int64_t target = -1;
+
+        if (!checkpoint_quarter_done && checkpoint_quarter_nt > 0) {
+            target = checkpoint_quarter_nt;
+        }
+
+        if (!checkpoint_midpoint_done && checkpoint_midpoint_nt > 0 &&
+                (target < 0 || checkpoint_midpoint_nt < target)) {
+            target = checkpoint_midpoint_nt;
+        }
+
+        if (next_periodic_checkpoint_nt > 0 &&
+                (target < 0 || next_periodic_checkpoint_nt < target)) {
+            target = next_periodic_checkpoint_nt;
+        }
+
+        return target;
     }
 
     void init_sampler() const {
@@ -3140,6 +3187,10 @@ private:
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
+                        slot.init_checkpoint_schedule(
+                            slot.task->n_tokens(),
+                            n_past,
+                            params_base.checkpoint_every_n_tokens);
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -3245,10 +3296,6 @@ private:
                     const bool n_before_user_known = n_before_user > 0;
                     const bool periodic_checkpointing_enabled = params_base.checkpoint_every_n_tokens > 0;
 
-                    if (do_checkpoint && periodic_checkpointing_enabled && slot.next_periodic_checkpoint_nt < 0) {
-                        slot.next_periodic_checkpoint_nt = params_base.checkpoint_every_n_tokens;
-                    }
-
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.n_tokens < n_batch) {
                         // get next token to process
@@ -3284,23 +3331,14 @@ private:
                             break;
                         }
 
-                        // process the last few tokens of the prompt separately in order to allow for a checkpoint to be created.
-                        // create checkpoints that many tokens before the end of the prompt:
-                        //  - 4 + n_ubatch
-                        //  - 4
-                        // ref: https://github.com/ggml-org/llama.cpp/pull/20288
-                        if (do_checkpoint && !periodic_checkpointing_enabled) {
-                            static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
-
-                            bool should_break = false;
-                            for (int offset : checkpoint_offsets) {
-                                const int n_last = std::min(n_batch, offset);
-                                if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
-                                    should_break = true;
-                                    break;
-                                }
-                            }
-                            if (should_break) {
+                        // Debugging long-context cache reuse is much easier when checkpoints
+                        // are anchored to broad prompt coverage rather than only the tail.
+                        // Stop the batch exactly at the scheduled 25% / 50% / periodic target
+                        // so the next batch starts there and the checkpoint lands near that point.
+                        if (do_checkpoint) {
+                            const int64_t next_checkpoint_target_nt = slot.next_prompt_checkpoint_target_nt();
+                            if (next_checkpoint_target_nt > 0 &&
+                                    slot.prompt.n_tokens() == next_checkpoint_target_nt) {
                                 break;
                             }
                         }
@@ -3308,8 +3346,6 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
-
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
@@ -3333,37 +3369,34 @@ private:
                     // their token position is the batch start rather than the prompt end
                     const int32_t n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
+                    bool is_quarter_checkpoint = false;
+                    bool is_midpoint_checkpoint = false;
                     bool is_periodic_checkpoint = false;
                     bool is_user_boundary_checkpoint = false;
-                    bool is_prompt_tail_checkpoint = false;
 
                     if (do_checkpoint) {
+                        is_quarter_checkpoint =
+                            !slot.checkpoint_quarter_done &&
+                            slot.checkpoint_quarter_nt > 0 &&
+                            n_tokens_start >= slot.checkpoint_quarter_nt;
+
+                        is_midpoint_checkpoint =
+                            !slot.checkpoint_midpoint_done &&
+                            slot.checkpoint_midpoint_nt > 0 &&
+                            n_tokens_start >= slot.checkpoint_midpoint_nt;
+
                         is_user_boundary_checkpoint =
                             n_before_user_known &&
                             n_tokens_start == n_before_user;
 
-                        const bool is_after_user =
-                            n_before_user_known &&
-                            n_tokens_start > n_before_user;
-
-                        if (periodic_checkpointing_enabled && near_prompt_end && (!n_before_user_known || is_after_user)) {
-                            SLT_DBG(slot, "%s", "near-end extra checkpoint suppressed because periodic checkpointing is enabled\n");
-                        }
-
-                        // With periodic scheduling enabled, tail extras are suppressed to
-                        // avoid redundant Gemma-sized checkpoints near prompt end.
-                        is_prompt_tail_checkpoint =
-                            !periodic_checkpointing_enabled &&
-                            near_prompt_end &&
-                            (!n_before_user_known || is_after_user);
-
                         is_periodic_checkpoint =
                             periodic_checkpointing_enabled &&
+                            slot.next_periodic_checkpoint_nt > 0 &&
                             n_tokens_start >= slot.next_periodic_checkpoint_nt;
 
-                        // Keep #22929 behavior for latest-user/tail checkpoints, while
-                        // explicitly re-enabling periodic mid-prompt checkpoints.
-                        if (!(is_user_boundary_checkpoint || is_prompt_tail_checkpoint || is_periodic_checkpoint)) {
+                        // Keep latest-user checkpoints as optional extras, but make broad
+                        // prompt coverage the primary scheduling strategy.
+                        if (!(is_quarter_checkpoint || is_midpoint_checkpoint || is_periodic_checkpoint || is_user_boundary_checkpoint)) {
                             do_checkpoint = false;
                         }
                     }
@@ -3397,12 +3430,28 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        if (is_quarter_checkpoint) {
+                            SLT_INF(slot,
+                                    "creating quarter context checkpoint at n_tokens = %d (target = %" PRId64 ")\n",
+                                    n_tokens_start, slot.checkpoint_quarter_nt);
+                        }
+                        if (is_midpoint_checkpoint) {
+                            SLT_INF(slot,
+                                    "creating midpoint context checkpoint at n_tokens = %d (target = %" PRId64 ")\n",
+                                    n_tokens_start, slot.checkpoint_midpoint_nt);
+                        }
                         if (is_periodic_checkpoint) {
                             SLT_INF(slot,
                                     "creating periodic context checkpoint at n_tokens = %d (interval = %d)\n",
                                     n_tokens_start, params_base.checkpoint_every_n_tokens);
                         }
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        if (is_quarter_checkpoint) {
+                            slot.checkpoint_quarter_done = true;
+                        }
+                        if (is_midpoint_checkpoint) {
+                            slot.checkpoint_midpoint_done = true;
+                        }
                     }
 
                     if (periodic_checkpointing_enabled && slot.next_periodic_checkpoint_nt > 0) {
