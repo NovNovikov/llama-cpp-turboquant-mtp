@@ -582,6 +582,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        const bool use_pre_norm = llama_get_embeddings_pre_norm(ctx_tgt) != nullptr;
 
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
         if (!is_mem_shared) {
@@ -596,8 +597,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // i.e. we cannot have seq_id like this: [0, 0, 0, 1, 1, 0, 1, 1]
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
-            const bool use_pre_norm = llama_get_embeddings_pre_norm(ctx_tgt) != nullptr;
-
             {
                 const float * h_tgt = use_pre_norm ? llama_get_embeddings_pre_norm(ctx_tgt) : llama_get_embeddings_nextn(ctx_tgt);
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
@@ -690,6 +689,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             return;
         }
 
+        const bool use_pre_norm = llama_get_embeddings_pre_norm(ctx_dft) != nullptr;
         int i = 0;
 
         while (n_drafting > 0) {
