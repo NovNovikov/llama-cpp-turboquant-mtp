@@ -18,6 +18,15 @@ TurboQuant+ is inspired by Google's original **TurboQuant** paper (ICLR 2026), w
 
 This fork is additive: every existing llama.cpp quantization, model, and backend continues to work unchanged. New types are opt-in via the standard `--cache-type-k` / `--cache-type-v` and `llama-quantize` interfaces.
 
+> This default branch tracks fresh upstream `ggml-org/llama.cpp` while preserving the local runtime work that matters for our server deployments:
+> - TurboQuant KV-cache support and kernels
+> - assistant-prefill handling for chat completions
+> - restored periodic prompt checkpointing for long SWA/hybrid contexts
+> - safer checkpoint invalidation after restore based on the real divergence boundary
+> - debug logging of the final rendered prompt and generated output in `llama-server`
+>
+> The older custom Gemma MTP branch was retired after upstream `llama.cpp` gained native MTP support, so this branch is now focused on keeping the TurboQuant integration and the server-side stability/debug fixes on top of current upstream.
+
 ## Production deployments
 
 This fork's TurboQuant integration is used in:
@@ -31,10 +40,10 @@ This fork's TurboQuant integration is used in:
 
 | | |
 |---|---|
-| Default branch | `feature/turboquant-kv-cache` |
-| Commits ahead of upstream | ~300 |
+| Default branch | `feature/turboquant-prefill` |
+| Branch focus | fresh upstream sync + TurboQuant + server/runtime fixes |
 | Upstream tracking | continuous sync from `ggml-org/llama.cpp` master |
-| Upstream PR status | not yet upstreamed; running as a long-lived feature branch |
+| Experimental Gemma MTP branch | retired after upstream native MTP landed |
 
 ---
 
