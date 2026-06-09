@@ -1,53 +1,51 @@
-# llama.cpp + TurboQuant+
+# llama.cpp TurboQuant Fork
 
-> Production-grade KV-cache and weight quantization for llama.cpp, with cross-backend kernel support for Apple Silicon, NVIDIA CUDA, AMD ROCm, and Vulkan.
+> Fresh upstream `llama.cpp` with TurboQuant preserved, plus local server/runtime fixes for assistant prefill, long-context checkpointing, and prompt/output debugging.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Status: WIP](https://img.shields.io/badge/status-work--in--progress-yellow.svg)](https://github.com/TheTom/llama-cpp-turboquant)
 [![Codec papers](https://img.shields.io/badge/codec-turboquant__plus-orange.svg)](https://github.com/TheTom/turboquant_plus)
 [![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
 [![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
 [![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
 [![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
 
-A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) integrating the **TurboQuant+** codec stack — Walsh-Hadamard rotated polar quantization, attention-gated sparse dequantization, and layer-aware V compression policies. The codec design, calibration, and validation papers live at [TheTom/turboquant_plus](https://github.com/TheTom/turboquant_plus); this repository is the llama.cpp runtime integration.
+This repository is a working fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). The goal is simple: stay close to fresh upstream while keeping the custom functionality we rely on in real deployments instead of re-losing it on every sync.
 
-### Lineage — why the `+`
+The current default branch is not an old experimental side branch. It is the main maintained line of this fork:
 
-TurboQuant+ is inspired by Google's original **TurboQuant** paper (ICLR 2026), which introduced Walsh-Hadamard-rotated polar codebook quantization for KV cache and demonstrated 4.6× compression at ~1% PPL loss. This project extends that foundation substantially — adding the asymmetric K/V policy (V is free, K is everything), layer-aware Boundary V protection, attention-gated sparse V dequantization, the `TQ3_1S` / `TQ4_1S` weight quantization formats, the `turbo2` / `turbo4` tier variants, the cross-backend kernel coverage (CUDA `dp4a`, HIP/ROCm RDNA/CDNA, Vulkan coopmat, Metal TurboFlash + V2.1 fused kernels), and a body of model-family-specific quality and operational fixes. The trailing `+` denotes that ongoing extension work; the original TurboQuant codec remains the foundation.
+- regularly synced with upstream `ggml-org/llama.cpp`
+- keeps TurboQuant support and related kernels
+- keeps server-side fixes that matter for long prompts and multi-turn chats
+- keeps debug tooling for inspecting what `llama-server` actually sends to and receives from the model
 
-This fork is additive: every existing llama.cpp quantization, model, and backend continues to work unchanged. New types are opt-in via the standard `--cache-type-k` / `--cache-type-v` and `llama-quantize` interfaces.
+## What Makes This Fork Different
 
-> This default branch tracks fresh upstream `ggml-org/llama.cpp` while preserving the local runtime work that matters for our server deployments:
-> - TurboQuant KV-cache support and kernels
-> - assistant-prefill handling for chat completions
-> - restored periodic prompt checkpointing for long SWA/hybrid contexts
-> - safer checkpoint invalidation after restore based on the real divergence boundary
-> - debug logging of the final rendered prompt and generated output in `llama-server`
->
-> The older custom Gemma MTP branch was retired after upstream `llama.cpp` gained native MTP support, so this branch is now focused on keeping the TurboQuant integration and the server-side stability/debug fixes on top of current upstream.
+### Upstream-first, but not upstream-only
 
-## Production deployments
+We track fresh upstream `llama.cpp`, but we intentionally carry a small set of local changes that are useful in production and awkward to lose:
 
-This fork's TurboQuant integration is used in:
+- **TurboQuant integration** for KV cache and weight quantization
+- **assistant-prefill preservation** for chat completions
+- **restored periodic checkpointing** for long SWA / hybrid contexts
+- **safer checkpoint invalidation after restore**, using the real prompt divergence boundary
+- **server debug logging** for the final rendered prompt and the generated output
 
-- [**LocalAI**](https://localai.io) — drop-in OpenAI-compatible local inference server
-- [**Chronara**](https://chronara.io) — quantum-safe fintech infrastructure with AI-driven networks
-- [**AtomicChat**](https://atomic.chat/) — on-device chat application
-- and other downstream projects
+### What happened to the old Gemma MTP branch
+
+This repository previously carried a custom Gemma MTP branch. That branch has been retired now that upstream `llama.cpp` has its own native MTP path. The default branch is therefore focused on keeping TurboQuant and the server/runtime fixes alive on top of current upstream, instead of maintaining an older parallel MTP implementation.
 
 ## Status
 
 | | |
 |---|---|
 | Default branch | `feature/turboquant-prefill` |
-| Branch focus | fresh upstream sync + TurboQuant + server/runtime fixes |
+| Primary goal | fresh upstream sync + TurboQuant + server/runtime fixes |
 | Upstream tracking | continuous sync from `ggml-org/llama.cpp` master |
-| Experimental Gemma MTP branch | retired after upstream native MTP landed |
+| Old custom Gemma MTP branch | retired |
 
----
+## TurboQuant in This Fork
 
-## What this fork adds
+### What this fork adds
 
 ### Quantization types
 
@@ -93,7 +91,7 @@ All turbo formats use Walsh-Hadamard rotation followed by polar codebook quantiz
 
 ---
 
-## Quick start
+## Fork-Specific Quick Start
 
 Standard llama.cpp build flags. TurboQuant types become available automatically once the matching backend is compiled in.
 
@@ -111,7 +109,7 @@ cmake -B build -DGGML_HIP=ON -DCMAKE_HIP_ARCHITECTURES="gfx1100;gfx942;gfx950" &
 cmake -B build -DGGML_VULKAN=ON && cmake --build build -j
 ```
 
-## Usage
+## TurboQuant Usage
 
 ### KV-cache quantization (runtime)
 
