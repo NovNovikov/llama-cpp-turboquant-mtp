@@ -575,6 +575,7 @@ struct common_params {
     std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;
     int image_max_tokens = -1;
+    int mtmd_batch_max_tokens = 1024;
 
     // finetune
     struct lr_opt lr;
@@ -606,7 +607,6 @@ struct common_params {
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT
-    std::string log_rendered_prompt = "";                                                                   // NOLINT
     std::string log_generated_output = "";                                                                  // NOLINT
     std::string chat_template = "";                                                                         // NOLINT
     bool use_jinja = true;                                                                                  // NOLINT

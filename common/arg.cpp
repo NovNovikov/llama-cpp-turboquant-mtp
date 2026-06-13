@@ -539,9 +539,8 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     auto parse_cli_args = [&]() {
         // Server debug convenience:
-        // allow prompt/output debug log flags without explicit paths and default
-        // them to local files in the current llama.cpp working directory.
-        static constexpr const char * k_default_rendered_prompt_log_path = "prompt.log";
+        // allow output debug log flag without an explicit path and default it
+        // to a local file in the current llama.cpp working directory.
         static constexpr const char * k_default_generated_output_log_path = "output.log";
         std::set<std::string> seen_args;
 
@@ -579,13 +578,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
 
                 // arg with single value
-                if (opt.handler_string && (arg == "--log-rendered-prompt" || arg == "--log-generated-output")) {
+                if (opt.handler_string && arg == "--log-generated-output") {
                     const bool has_next_value = (i + 1 < argc) && (argv[i + 1][0] != '-');
                     if (!has_next_value) {
-                        opt.handler_string(params,
-                                arg == "--log-rendered-prompt"
-                                    ? k_default_rendered_prompt_log_path
-                                    : k_default_generated_output_log_path);
+                        opt.handler_string(params, k_default_generated_output_log_path);
                         continue;
                     }
                 }
@@ -2272,6 +2268,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.image_max_tokens = value;
         }
     ).set_examples(mmproj_examples).set_env("LLAMA_ARG_IMAGE_MAX_TOKENS"));
+    add_opt(common_arg(
+        {"--mtmd-batch-max-tokens"}, "N",
+        string_format("maximum number of image tokens per batch when encoding images (default: %d)", params.mtmd_batch_max_tokens),
+        [](common_params & params, int value) {
+            params.mtmd_batch_max_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_MTMD_BATCH_MAX_TOKENS"));
     if (llama_supports_rpc()) {
         add_opt(common_arg(
             {"--rpc"}, "SERVERS",
@@ -2896,13 +2899,6 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.api_prefix = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_PREFIX"));
-    add_opt(common_arg(
-        {"--log-rendered-prompt"}, "PATH",
-        "debug: append final rendered prompt (after chat template/Jinja/prefill) as JSONL for each chat/completion request (if PATH omitted, defaults to ./prompt.log)",
-        [](common_params & params, const std::string & value) {
-            params.log_rendered_prompt = value;
-        }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_RENDERED_PROMPT"));
     add_opt(common_arg(
         {"--log-generated-output"}, "PATH",
         "debug: append final generated output as JSONL for each chat/completion request (if PATH omitted, defaults to ./output.log)",

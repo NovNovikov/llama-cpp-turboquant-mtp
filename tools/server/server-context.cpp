@@ -86,6 +86,8 @@ struct server_slot {
 
     // multimodal
     mtmd_context * mctx = nullptr;
+    mtmd::batch_ptr mbatch = nullptr;
+    std::array<llama_context *, 2> mtgt = {nullptr, nullptr}; // [0] for main context, [1] for optional draft context
 
     // speculative decoding
     common_speculative * spec;
@@ -255,6 +257,18 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        // clear multimodal state
+        mbatch.reset();
+        mtgt[0] = ctx_tgt;
+        mtgt[1] = nullptr;
+        if (ctx_dft && llama_get_ctx_other(ctx_dft) != ctx_tgt) {
+            // TODO: in the future, figure out how to infuse target embeddings to the images
+            //       for now, we re-decode the same chunk in both ctx_tgt and ctx_dft
+            //       maybe we simply need to call `common_speculative_process()` ?
+            //       [TAG_MTMD_DRAFT_PROCESSING]
+            mtgt[1] = ctx_dft;
+        }
     }
 
     void init_checkpoint_schedule(const int32_t n_tokens_total, const int32_t n_past, const int32_t step) {
@@ -637,17 +651,88 @@ struct server_slot {
         other.prompt = prompt.clone();
         other.init_sampler();
     }
-};
 
-// Debug helper: extract the final rendered prompt text from request payload.
-// This reflects the prompt after chat template/Jinja/prefill insertion.
-static std::string debug_get_rendered_prompt_text(const json & data) {
-    std::string rendered_prompt;
-    if (const auto prompt = data.find("prompt"); prompt != data.end()) {
-        rendered_prompt = prompt->is_string() ? prompt->get<std::string>() : prompt->dump();
+    // returns 0 on success
+    // caller need to update prompt.tokens after a successful call to keep track of the processing progress
+    int process_mtmd_chunk(size_t idx, size_t & n_tokens_out) {
+        GGML_ASSERT(mctx);
+        const auto & input_tokens = task->tokens;
+        auto & chunk = input_tokens.find_chunk(idx);
+        int32_t res = 0;
+
+        auto try_decode = [&]() -> int32_t {
+            if (mbatch) {
+                float * embd = mtmd_batch_get_output_embd(mbatch.get(), chunk.get());
+                if (embd) {
+                    for (auto * lctx : mtgt) {
+                        if (lctx == nullptr) {
+                            continue;
+                        }
+                        llama_pos new_n_past; // unused for now
+                        res = mtmd_helper_decode_image_chunk(
+                            mctx,
+                            lctx,
+                            chunk.get(),
+                            embd,
+                            prompt.tokens.pos_next(),
+                            id,
+                            llama_n_batch(lctx),
+                            &new_n_past
+                        );
+                        if (res != 0) {
+                            SLT_ERR(*this, "failed to decode mtmd chunk, idx = %zu, res = %d\n", idx, res);
+                            return -1;
+                        }
+                    }
+                    n_tokens_out = mtmd_input_chunk_get_n_tokens(chunk.get());
+                    return 0; // success
+                }
+            }
+            return 1; // (non-error) need to create & encode batch
+        };
+
+        // if the batch is already exist, try searching & encode
+        res = try_decode();
+        if (res == 0) {
+            return 0;
+        } else if (res < 0) {
+            // fatal error
+            return res;
+        }
+
+        // otherwise, the batch is either uninitialized or is used up
+        // we need to create & encode a new batch
+        mbatch.reset(mtmd_batch_init(mctx));
+        res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
+        GGML_ASSERT(res == 0); // we should never have an empty batch
+
+        // try batching as much as possible
+        int n_added = 1;
+        size_t idx_cur = idx;
+        while (res == 0) {
+            auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
+            if (next_chunk == nullptr) {
+                break;
+            }
+            res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
+            n_added += (res == 0 ? 1 : 0);
+            idx_cur = next_idx;
+            SLT_DBG(*this, "try adding media chunk idx = %zu to batch, res = %d\n", next_idx, res);
+            // if res != 0, batch is full or chunk is not compatible -> this loop breaks
+        }
+
+        // TODO @ngxson : move this log line to debug when it become more stable
+        SLT_INF(*this, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
+
+        res = mtmd_batch_encode(mbatch.get());
+        if (res != 0) {
+            SLT_ERR(*this, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
+            return -1;
+        }
+
+        return try_decode();
     }
-    return rendered_prompt;
-}
+};
 
 static std::string debug_make_timestamp_utc() {
     const auto now = std::chrono::system_clock::now();
@@ -688,22 +773,6 @@ static void debug_append_jsonl_record(const std::string & path, const char * fla
     out << rec.dump() << '\n';
 }
 
-// Debug helper: print rendered prompt right before timing summary lines.
-// Enabled only when --log-rendered-prompt is set.
-static void debug_log_rendered_prompt_console_before_timings(const common_params & params, const server_slot & slot) {
-    if (params.log_rendered_prompt.empty()) {
-        return;
-    }
-    if (!slot.task || slot.task->debug_rendered_prompt.empty()) {
-        return;
-    }
-
-    const auto & rendered_prompt = slot.task->debug_rendered_prompt;
-    SLT_INF(slot, "rendered_prompt debug BEGIN (%zu chars)\n", rendered_prompt.size());
-    SLT_INF(slot, "%s\n", rendered_prompt.c_str());
-    SLT_INF(slot, "%s", "rendered_prompt debug END\n");
-}
-
 // Debug helper: print final generated output to the server console when explicitly enabled.
 // This is intended for prompt/output rendering diagnostics only.
 static void debug_log_generated_output_console(const common_params & params, const server_slot & slot, const std::string & generated_output) {
@@ -718,7 +787,7 @@ static void debug_log_generated_output_console(const common_params & params, con
 
 // Debug helper:
 // appends one JSONL record with the final generated output from server chat/completion paths.
-// Kept separate from prompt logging so each trace can be enabled independently.
+// Kept separate from built-in prompt logging so output tracing can be enabled independently.
 static void debug_log_generated_output_jsonl(
         const common_params & params,
         const server_slot & slot,
@@ -951,6 +1020,7 @@ private:
             mparams.warmup           = params_base.warmup;
             mparams.image_min_tokens = params_base.image_min_tokens;
             mparams.image_max_tokens = params_base.image_max_tokens;
+            mparams.batch_max_tokens = params_base.mtmd_batch_max_tokens;
             mparams.media_marker     = get_media_marker();
         }
 
@@ -1036,10 +1106,7 @@ private:
                     }
 
                     for (size_t j = 0; j < devs.size(); ++j) {
-                        const size_t bytes =
-                            (measure_model_bytes ? dmd[j].mb.model : 0) +
-                            dmd[j].mb.context +
-                            dmd[j].mb.compute;
+                        const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
                         total += bytes;
                         for (size_t i = 0; i < tgt_devices.size(); i++) {
                             if (tgt_devices[i] == devs[j]) {
@@ -2301,6 +2368,9 @@ private:
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
 
+        // [TAG_CHECKPOINTS_FIX_POS_MIN]
+        // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
+        //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt,       slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
@@ -2933,7 +3003,6 @@ private:
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
 
-                            debug_log_rendered_prompt_console_before_timings(params_base, slot);
                             slot.print_timings();
                             send_final_response(slot);
                             slot.release();
@@ -3136,6 +3205,10 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
+                                            // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
+                                            if (cur.pos_max > pos_next) {
+                                                return false;
+                                            }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;
                                         }
                                     );
@@ -3212,7 +3285,7 @@ private:
                                 send_partial_response(slot, {}, false, true);
                             }
                         }
-                    }
+                    } // end of SLOT_STATE_STARTED
 
                     if (!slot.can_split()) {
                         // cannot fit the prompt in the current batch - will try next iter
@@ -3267,10 +3340,18 @@ private:
                     bool has_mtmd = false;
 
                     // check if we should process the image
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && input_tokens[slot.prompt.n_tokens()] == LLAMA_TOKEN_NULL) {
+                    while (true) {
+                        auto cur_token_idx = slot.prompt.n_tokens();
+                        if (
+                            cur_token_idx >= slot.task->n_tokens() ||
+                            input_tokens[cur_token_idx] != LLAMA_TOKEN_NULL // encountered a text token
+                        ) {
+                            break;
+                        }
+
                         // process the image
                         size_t n_tokens_out = 0;
-                        int32_t res = input_tokens.process_chunk(ctx_tgt, mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
+                        int32_t res = slot.process_mtmd_chunk(cur_token_idx, n_tokens_out);
                         if (res != 0) {
                             SLT_ERR(slot, "failed to process image, res = %d\n", res);
                             send_error(slot, "failed to process image", ERROR_TYPE_SERVER);
@@ -3278,22 +3359,11 @@ private:
                             continue;
                         }
 
-                        if (ctx_dft && llama_get_ctx_other(ctx_dft.get()) != ctx_tgt) {
-                            // TODO: in the future, figure out how to infuse target embeddings to the images
-                            //       for now, we skip this for simplicity
-                            //       maybe we simply need to call `common_speculative_process()` on the mtmd batches in the `process_chunk` above?
-                            //       [TAG_MTMD_DRAFT_PROCESSING]
-                            res = input_tokens.process_chunk(ctx_dft.get(), mctx, slot.prompt.n_tokens(), slot.prompt.tokens.pos_next(), slot.id, n_tokens_out);
-                            if (res != 0) {
-                                GGML_ABORT("failed to process multi-modal data on draft context\n");
-                            }
-                        }
-
                         slot.n_prompt_tokens_processed += n_tokens_out;
 
                         // add the image chunk to cache
                         {
-                            const auto & chunk = input_tokens.find_chunk(slot.prompt.n_tokens());
+                            const auto & chunk = input_tokens.find_chunk(cur_token_idx);
                             slot.prompt.tokens.push_back(chunk.get()); // copy
                         }
 
@@ -3733,7 +3803,6 @@ private:
 
                 if (!process_token(result, slot)) {
                     // release slot because of stop condition
-                    debug_log_rendered_prompt_console_before_timings(params_base, slot);
                     slot.print_timings();
                     send_final_response(slot);
                     metrics.on_prediction(slot);
@@ -3848,7 +3917,6 @@ private:
                     slot.n_decoded += 1;
 
                     if (!process_token(result, slot)) {
-                        debug_log_rendered_prompt_console_before_timings(params_base, slot);
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);
@@ -4023,47 +4091,6 @@ static int32_t prompt_get_n_before_user(
     return result;
 }
 
-// Debug-only helper:
-// appends one JSONL record with the final rendered prompt used by server chat/completion paths.
-// This is intentionally isolated to server code and must not affect generation behavior.
-static void debug_log_rendered_prompt_jsonl(
-        const common_params & params,
-        const server_http_req & req,
-        const json & data,
-        const std::vector<server_tokens> & inputs,
-        const std::string & fallback_request_id) {
-    if (params.log_rendered_prompt.empty()) {
-        return;
-    }
-
-    const std::string rendered_prompt = debug_get_rendered_prompt_text(data);
-
-    int64_t prompt_token_count = 0;
-    for (const auto & t : inputs) {
-        prompt_token_count += (int64_t) t.size();
-    }
-
-    const std::string request_id = debug_extract_request_id(req, fallback_request_id);
-
-    json rec = {
-        {"timestamp",          debug_make_timestamp_utc()},
-        {"endpoint",           req.path},
-        {"prompt_char_length", (int64_t) rendered_prompt.size()},
-        {"prompt_token_count", prompt_token_count},
-        {"rendered_prompt",    rendered_prompt},
-    };
-
-    if (data.contains("id_slot")) {
-        rec["slot_id"] = json_value(data, "id_slot", -1);
-    }
-    if (!request_id.empty()) {
-        rec["request_id"] = request_id;
-    }
-
-    debug_append_jsonl_record(params.log_rendered_prompt, "--log-rendered-prompt", rec);
-}
-
-
 //
 // server_routes
 //
@@ -4109,12 +4136,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
         }
 
-        if (type == SERVER_TASK_TYPE_COMPLETION) {
-            // Debug prompt-rendering trace: logs exactly what is about to be tokenized/generated.
-            debug_log_rendered_prompt_jsonl(params, req, data, inputs, completion_id);
-        }
-
-        const std::string rendered_prompt_for_debug = debug_get_rendered_prompt_text(data);
         const std::string request_id_for_debug = debug_extract_request_id(req, completion_id);
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
@@ -4125,7 +4146,6 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.id = rd.get_new_id();
 
             task.tokens = std::move(inputs[i]);
-            task.debug_rendered_prompt = rendered_prompt_for_debug;
             task.debug_request_id = request_id_for_debug;
             task.debug_endpoint   = req.path;
             task.params = server_task::params_from_json_cmpl(

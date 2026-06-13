@@ -1,6 +1,7 @@
 # llama.cpp TurboQuant Fork
 
-> Fresh upstream `llama.cpp` with TurboQuant preserved, plus local server/runtime fixes for assistant prefill, long-context checkpointing, and prompt/output debugging.
+![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+> Fresh upstream `llama.cpp` with TurboQuant preserved, plus local server/runtime fixes for assistant prefill and long-context checkpointing.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Codec papers](https://img.shields.io/badge/codec-turboquant__plus-orange.svg)](https://github.com/TheTom/turboquant_plus)
@@ -16,7 +17,7 @@ The current default branch is not an old experimental side branch. It is the mai
 - regularly synced with upstream `ggml-org/llama.cpp`
 - keeps TurboQuant support and related kernels
 - keeps server-side fixes that matter for long prompts and multi-turn chats
-- keeps debug tooling for inspecting what `llama-server` actually sends to and receives from the model
+- stays close to upstream server behavior instead of carrying a parallel debug surface
 
 ## What Makes This Fork Different
 
@@ -28,7 +29,6 @@ We track fresh upstream `llama.cpp`, but we intentionally carry a small set of l
 - **assistant-prefill preservation** for chat completions
 - **restored periodic checkpointing** for long SWA / hybrid contexts
 - **safer checkpoint invalidation after restore**, using the real prompt divergence boundary
-- **server debug logging** for the final rendered prompt and the generated output
 
 ### What happened to the old Gemma MTP branch
 

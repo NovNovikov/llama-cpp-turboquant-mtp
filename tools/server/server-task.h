@@ -150,10 +150,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
-    // Debug-only: final prompt text after chat-template/Jinja/prefill rendering.
-    // Used by server logging, does not affect generation behavior.
-    std::string debug_rendered_prompt;
-    // Debug-only request metadata for server-side JSONL logging.
+    // Debug-only request metadata for server-side JSONL output logging.
     std::string debug_request_id;
     std::string debug_endpoint;
 
@@ -244,7 +241,6 @@ struct server_task {
         copy.params    = params;
         copy.type      = type;
         copy.tokens    = tokens.clone();
-        copy.debug_rendered_prompt = debug_rendered_prompt;
         copy.debug_request_id = debug_request_id;
         copy.debug_endpoint   = debug_endpoint;
         copy.id_slot   = -1; // child tasks cannot specify slot
