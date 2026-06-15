@@ -2441,13 +2441,17 @@ ggml_cgraph * llama_context::graph_reserve(
     llama_batch_allocr balloc(model.hparams.n_pos_per_embd());
     llama_ubatch ubatch = balloc.ubatch_reserve(n_tokens/n_seqs, n_seqs);
 
-    // set one output token per sequence in order to activate all backend samplers
-    std::vector<llama_seq_id> seq_ids(n_seqs);
-    for (uint32_t i = 0; i < n_seqs; ++i) {
-        seq_ids[i] = i;
+    // Seed the synthetic reserve ubatch with valid per-token metadata so graph
+    // inputs such as out_ids stay deterministic even when reserve-time n_outputs
+    // is larger than the number of sequences.
+    std::vector<llama_seq_id> seq_ids(ubatch.n_tokens);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const uint32_t seq = i % n_seqs;
+        seq_ids[i] = seq;
         ubatch.n_seq_id[i] = 1;
         ubatch.seq_id[i] = &seq_ids[i];
-        ubatch.output[i] = true;
+        ubatch.pos[i] = i / n_seqs;
+        ubatch.output[i] = i < n_outputs;
     }
 
     auto * res = gf_res_reserve.get();

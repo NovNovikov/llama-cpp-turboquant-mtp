@@ -226,6 +226,7 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
 
     GGML_ASSERT(ggml_backend_buffer_is_host(out_ids->buffer));
     int32_t * data = (int32_t *) out_ids->data;
+    std::fill_n(data, n_outputs, 0);
 
     if (n_outputs == n_tokens) {
         for (int i = 0; i < n_tokens; ++i) {
@@ -244,6 +245,8 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
             data[n_outputs++] = i;
         }
     }
+
+    GGML_ASSERT(n_outputs <= this->n_outputs);
 }
 
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {

@@ -655,7 +655,7 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (inp_out_ids) {
+    if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
     cb(cur, "mtp_shared_head_norm", -1);
