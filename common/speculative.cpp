@@ -45,6 +45,14 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
     return result.empty() ? "default" : result;
 }
 
+static std::string common_speculative_get_model_arch(const llama_model * model) {
+    char buf[128] = { 0 };
+    if (model != nullptr && llama_model_meta_val_str(model, "general.architecture", buf, sizeof(buf)) > 0) {
+        return buf;
+    }
+    return {};
+}
+
 struct common_speculative_config {
     common_speculative_type type;
     common_params_speculative params;
@@ -899,13 +907,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
         }
 
-        llama_set_embeddings_pre_norm(ctx_tgt, true);
+        const std::string arch_tgt = common_speculative_get_model_arch(llama_get_model(ctx_tgt));
+        const std::string arch_dft = common_speculative_get_model_arch(llama_get_model(ctx_dft));
+        const bool is_gemma4_mtp = arch_tgt == "gemma4" && arch_dft == "gemma4-assistant";
+
+        // Qwen/Step-style native MTP consumes the target's pre-norm rows.
+        // Gemma4 assistants instead consume the target's post-final-norm hidden
+        // state via t_h_nextn, so keep nextn export enabled for that path.
+        llama_set_embeddings_pre_norm(ctx_tgt, !is_gemma4_mtp);
         llama_set_embeddings_pre_norm(ctx_dft, true);
-        // draft-mtp verification reads target hidden states from pre-norm rows,
-        // so requesting target nextn tensors is unnecessary and can trip backend
-        // export assertions on some models/backends.
-        llama_set_embeddings_nextn(ctx_tgt, false, /*masked*/ false);
-        llama_set_embeddings_nextn(ctx_dft, true,  /*masked*/ true);
+        llama_set_embeddings_nextn(ctx_tgt, is_gemma4_mtp, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_dft, true,        /*masked*/ true);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
 

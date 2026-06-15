@@ -1178,6 +1178,10 @@ void llama_context::set_embeddings_pre_norm(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
     cparams.embeddings_pre_norm = value;
+    // Debug/speculative helpers toggle this after context construction.
+    // The graph outputs change when pre-norm export is enabled/disabled, so the
+    // scheduler must rebuild its reserve state before the next decode.
+    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
@@ -1185,6 +1189,10 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+    // Debug/speculative helpers toggle this after context construction.
+    // The graph outputs change when nextn export is enabled/disabled, so the
+    // scheduler must rebuild its reserve state before the next decode.
+    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
