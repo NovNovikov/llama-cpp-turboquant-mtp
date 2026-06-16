@@ -1177,10 +1177,21 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_pre_norm(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
+    if (cparams.embeddings_pre_norm == value) {
+        return;
+    }
+
     cparams.embeddings_pre_norm = value;
-    // Debug/speculative helpers toggle this after context construction.
-    // The graph outputs change when pre-norm export is enabled/disabled, so the
-    // scheduler must rebuild its reserve state before the next decode.
+    // For native MTP draft contexts the graph always exposes t_h_pre_norm and
+    // this switch only controls whether host-side extraction is requested.
+    // Re-reserving the whole scheduler on every prompt-sync decode would make
+    // Qwen-style MTP spend hundreds of ms per draft step in sched_reserve().
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        return;
+    }
+
+    // Default decoder graphs may change their output selection when pre-norm
+    // export is toggled, so those contexts still need a fresh reserve pass.
     sched_need_reserve = true;
 }
 
