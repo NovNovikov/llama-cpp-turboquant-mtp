@@ -535,6 +535,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     };
 
     auto parse_cli_args = [&]() {
+        // Server debug convenience:
+        // allow output debug log flag without an explicit path and default it
+        // to a local file in the current llama.cpp working directory.
+        static constexpr const char * k_default_generated_output_log_path = "output.log";
         std::set<std::string> seen_args;
 
         for (int i = 1; i < argc; i++) {
@@ -571,6 +575,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 }
 
                 // arg with single value
+                if (opt.handler_string && arg == "--log-generated-output") {
+                    const bool has_next_value = (i + 1 < argc) && (argv[i + 1][0] != '-');
+                    if (!has_next_value) {
+                        opt.handler_string(params, k_default_generated_output_log_path);
+                        continue;
+                    }
+                }
                 check_arg(i);
                 std::string val = argv[++i];
                 if (opt.handler_int) {
@@ -1331,6 +1342,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.n_ctx_checkpoints = value;
         }
     ).set_env("LLAMA_ARG_CTX_CHECKPOINTS").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"-cpent", "--checkpoint-every-n-tokens"}, "N",
+        string_format("create context checkpoints every N prompt tokens during prefill (default: %d, <= 0 disables periodic scheduling)",
+                      params.checkpoint_every_n_tokens),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("checkpoint-every-n-tokens must be >= -1");
+            }
+            params.checkpoint_every_n_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_CHECKPOINT_EVERY_NT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"-cms", "--checkpoint-min-step"}, "N",
         string_format("minimum spacing between context checkpoints in tokens (default: %d, 0 = no minimum)", params.checkpoint_min_step),
@@ -2874,6 +2896,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.api_prefix = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_PREFIX"));
+    add_opt(common_arg(
+        {"--log-generated-output"}, "PATH",
+        "debug: append final generated output as JSONL for each chat/completion request (if PATH omitted, defaults to ./output.log)",
+        [](common_params & params, const std::string & value) {
+            params.log_generated_output = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_GENERATED_OUTPUT"));
     // Deprecated: use --ui-config instead (kept for backward compat)
     add_opt(common_arg(
         {"--webui-config"}, "JSON",
@@ -3254,6 +3283,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         string_format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),
         [](common_params & params, const std::string & value) {
             params.slot_prompt_similarity = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-cache-key-similarity"}, "SIMILARITY",
+        string_format("how much the prompt of a cache_key request must match the cached slot prompt before reusing it (default: %.2f, 0.0 = disable ratio check)\n", params.slot_cache_key_similarity),
+        [](common_params & params, const std::string & value) {
+            params.slot_cache_key_similarity = std::stof(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-cache-key-min-prefix"}, "N",
+        string_format("minimum common-prefix tokens required before reusing a cache_key slot (default: %d, 0 = disabled)\n", params.slot_cache_key_min_prefix),
+        [](common_params & params, const std::string & value) {
+            params.slot_cache_key_min_prefix = std::stoi(value);
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
